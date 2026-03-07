@@ -24,7 +24,7 @@ ALTER TABLE table_name SET (timescaledb.compress = false);
 ### Создать политику (джоб) автоматического сжатия
 Сжимать все чанки, в которых данные старше 90 дней:
 ```sql
-SELECT add_compression_policy('table_name', compress_after => INTERVAL '90 days');
+CALL add_columnstore_policy('lk_sessions', after => INTERVAL '24 weeks');
 ```
 
 ### Удалить политику сжатия
