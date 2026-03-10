@@ -40,9 +40,8 @@ WHERE table_name = 'your_table';
 Если таблица оказалась не гипертаблицей и в ней уже есть данные:
 ```sql
 SELECT create_hypertable(
-  'your_table',
-  'created_at',                -- колонка с временем
-  migrate_data => true,        -- перенести существующие данные (блокирует таблицу на время миграции!)
-  chunk_time_interval => INTERVAL '1 day'
+    'mpgg_stat.mpgg_sessions'::regclass,
+    by_range('created_at', INTERVAL '14 days'),
+    migrate_data => true
 );
 ```
