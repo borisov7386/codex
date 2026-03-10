@@ -1,0 +1,30 @@
+SELECT
+    -- Вырезаем префикс вида "_hyper_182_11626_chunk_" → оставляем только смысловое имя
+    regexp_replace(psi.indexrelname, '^_hyper_\d+_\d+_chunk_', '') AS index_name,
+
+    sum(psi.idx_scan)                                               AS total_scans,
+    sum(psi.idx_tup_read)                                          AS total_tup_read,
+    sum(psi.idx_tup_fetch)                                         AS total_tup_fetch,
+    pg_size_pretty(sum(pg_relation_size(psi.indexrelid)))           AS total_index_size,
+    sum(pg_relation_size(psi.indexrelid))                           AS total_index_size_bytes,
+    count(*)                                                        AS chunks_count,
+
+    -- Достаточно одного чанка, чтобы понять — UNIQUE или нет
+    bool_or(pi.indisunique)                                         AS is_unique,
+
+    CASE
+        WHEN bool_or(pi.indisunique)   THEN '✅ Нельзя удалять — UNIQUE/PK'
+        WHEN sum(psi.idx_scan) = 0     THEN '🔴 Никогда не использовался — кандидат на удаление'
+        WHEN sum(psi.idx_scan) < 50    THEN '🟡 Редко используется — проверить'
+        ELSE                                '🟢 Активно используется'
+    END AS verdict
+
+FROM pg_stat_user_indexes psi
+JOIN pg_index pi ON pi.indexrelid = psi.indexrelid
+JOIN _timescaledb_catalog.chunk c
+    ON psi.schemaname = c.schema_name AND psi.relname = c.table_name
+JOIN _timescaledb_catalog.hypertable h
+    ON c.hypertable_id = h.id
+WHERE h.table_name = 'lk_sessions'   -- ← замените на ваше имя
+GROUP BY 1
+ORDER BY total_scans ASC, total_index_size_bytes DESC;
