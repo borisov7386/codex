@@ -1,0 +1,41 @@
+DO $$
+DECLARE
+  chunk_rec RECORD;
+  total_chunks INT;
+  current_num  INT := 0;
+BEGIN
+  SELECT COUNT(*) INTO total_chunks
+  FROM timescaledb_information.chunks
+  WHERE hypertable_name = 'lk_events'
+    AND is_compressed = true;
+
+  RAISE NOTICE 'Найдено сжатых чанков: %', total_chunks;
+
+  FOR chunk_rec IN
+    SELECT format('%I.%I', chunk_schema, chunk_name) AS chunk,
+           range_start,
+           range_end
+    FROM timescaledb_information.chunks
+    WHERE hypertable_name = 'lk_events'
+      AND is_compressed = true
+    ORDER BY range_start ASC   -- старые сначала, горячие данные трогаем последними
+  LOOP
+    current_num := current_num + 1;
+
+    RAISE NOTICE '[%/%] Перепаковка чанка: % (% — %)',
+      current_num, total_chunks,
+      chunk_rec.chunk,
+      chunk_rec.range_start,
+      chunk_rec.range_end;
+
+    -- Шаг 1: распаковать в строчный формат
+    CALL convert_to_rowstore(chunk_rec.chunk::regclass);
+
+    -- Шаг 2: пересжать по новым настройкам segmentby/orderby
+    CALL convert_to_columnstore(chunk_rec.chunk::regclass);
+
+    RAISE NOTICE '[%/%] Готово: %', current_num, total_chunks, chunk_rec.chunk;
+  END LOOP;
+
+  RAISE NOTICE 'Все % чанков перепакованы.', total_chunks;
+END $$;
