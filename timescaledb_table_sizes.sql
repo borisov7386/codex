@@ -4,30 +4,18 @@
 -- Сортировка:   сначала обычные таблицы, затем гипертаблицы (по убыванию размера)
 --
 -- Столбцы для гипертаблиц:
+--   row_count               — ТОЧНОЕ кол-во строк через COUNT(*)
+--                             ВНИМАНИЕ: запрос выполняется дольше на больших таблицах
 --   total_size              — полный размер таблицы (индексы + все чанки)
 --   data_size               — heap-данные (без индексов)
 --   index_size              — индексы
 --   columnstore             — включено ли сжатие
 --   chunk_interval          — интервал партиционирования
---   row_count               — приближённое кол-во строк
---                             для таблиц: pg_class.reltuples
---                             для гипертаблиц: approximate_row_count() —
---                               сумма reltuples по всем чанкам,
---                               учитывает батчи сжатых чанков
---
---   uncompressed_chunks     — физический размер чанков, которые НЕ сжаты (на диске)
---   compressed_chunks       — физический размер чанков, которые УЖЕ сжаты (на диске)
---     источник: hypertable_chunk_local_size
---     несжатый чанк:  compressed_total_size = 0  → его размер = total_bytes
---     сжатый чанк:    compressed_total_size > 0  → его размер = compressed_total_size
---
+--   uncompressed_chunks     — физический размер несжатых чанков на диске
+--   compressed_chunks       — физический размер сжатых чанков на диске
 --   before_compression_size — каким был бы размер сжатых чанков без сжатия
 --   after_compression_size  — сколько сжатые чанки занимают сейчас
---     источник: hypertable_compression_stats() → before/after_compression_total_bytes
---     NULL — если ни один чанк ещё не сжат
---
---   compression_ratio       — before / after (чем выше, тем лучше сжатие)
---     NULL — если нет сжатых чанков
+--   compression_ratio       — before / after
 -- =============================================================================
 
 
@@ -56,14 +44,24 @@ table_stats AS (
         pg_indexes_size(c.oid)        AS index_bytes,
         NULL::boolean  AS compression_enabled,
         NULL::interval AS chunk_interval,
-        -- Приближённое кол-во строк из статистики планировщика
-        GREATEST(c.reltuples, 0)::bigint AS row_count,
+        rc.row_count,
         NULL::bigint   AS uncompressed_chunks_bytes,
         NULL::bigint   AS compressed_chunks_bytes,
         NULL::bigint   AS before_compression_bytes,
         NULL::bigint   AS after_compression_bytes
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
+    -- ТОЧНЫЙ COUNT(*)
+    CROSS JOIN LATERAL (
+        SELECT COUNT(*) AS row_count
+        FROM pg_catalog.pg_class c2
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS row_count
+            FROM ONLY format('%I.%I', n.nspname, c.relname)::regclass
+        ) _cnt
+        WHERE c2.oid = c.oid
+        LIMIT 1
+    ) rc
     WHERE n.nspname = 'public'
       AND c.relkind = 'r'
       AND NOT EXISTS (
@@ -88,10 +86,7 @@ table_stats AS (
         COALESCE(s.index_bytes, 0)  AS index_bytes,
         h.compression_enabled       AS compression_enabled,
         d.time_interval             AS chunk_interval,
-        -- approximate_row_count учитывает батчи сжатых чанков
-        approximate_row_count(
-            format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
-        )                           AS row_count,
+        rc.row_count,
         COALESCE(ch.uncompressed_chunks_bytes, 0) AS uncompressed_chunks_bytes,
         COALESCE(ch.compressed_chunks_bytes,   0) AS compressed_chunks_bytes,
         cs.before_compression_total_bytes         AS before_compression_bytes,
@@ -100,6 +95,12 @@ table_stats AS (
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) s
+    -- ТОЧНЫЙ COUNT(*) по всей гипертаблице (включая все чанки)
+    CROSS JOIN LATERAL (
+        SELECT COUNT(*) AS row_count
+        FROM ONLY format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
+        -- ONLY не подходит для гипертаблицы, используем без ONLY
+    ) rc
     LEFT JOIN LATERAL (
         SELECT time_interval
         FROM timescaledb_information.dimensions d
@@ -178,13 +179,17 @@ table_stats AS (
         pg_indexes_size(c.oid)        AS index_bytes,
         NULL::boolean  AS compression_enabled,
         NULL::interval AS chunk_interval,
-        GREATEST(c.reltuples, 0)::bigint AS row_count,
+        rc.row_count,
         NULL::bigint   AS uncompressed_chunks_bytes,
         NULL::bigint   AS compressed_chunks_bytes,
         NULL::bigint   AS before_compression_bytes,
         NULL::bigint   AS after_compression_bytes
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
+    CROSS JOIN LATERAL (
+        SELECT COUNT(*) AS row_count
+        FROM ONLY format('%I.%I', n.nspname, c.relname)::regclass
+    ) rc
     WHERE c.relkind = 'r'
       AND n.nspname NOT IN (
           'pg_catalog', 'information_schema',
@@ -213,9 +218,7 @@ table_stats AS (
         COALESCE(s.index_bytes, 0)  AS index_bytes,
         h.compression_enabled       AS compression_enabled,
         d.time_interval             AS chunk_interval,
-        approximate_row_count(
-            format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
-        )                           AS row_count,
+        rc.row_count,
         COALESCE(ch.uncompressed_chunks_bytes, 0) AS uncompressed_chunks_bytes,
         COALESCE(ch.compressed_chunks_bytes,   0) AS compressed_chunks_bytes,
         cs.before_compression_total_bytes         AS before_compression_bytes,
@@ -224,6 +227,10 @@ table_stats AS (
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) s
+    CROSS JOIN LATERAL (
+        SELECT COUNT(*) AS row_count
+        FROM format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
+    ) rc
     LEFT JOIN LATERAL (
         SELECT time_interval
         FROM timescaledb_information.dimensions d
