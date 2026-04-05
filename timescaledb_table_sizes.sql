@@ -2,8 +2,8 @@
 -- TimescaleDB: размеры таблиц и гипертаблиц
 -- Версия: TimescaleDB 2.18+
 -- Сортировка: сначала обычные таблицы, затем гипертаблицы (по убыванию размера)
--- Столбец columnstore: для гипертаблиц показывает статус сжатия (Columnstore)
---   Источник: timescaledb_information.hypertables.compression_enabled
+-- Столбец columnstore:   статус сжатия (compression_enabled из hypertables)
+-- Столбец chunk_interval: текущий чанк-интервал (time_interval из dimensions)
 -- =============================================================================
 
 
@@ -20,7 +20,8 @@ WITH table_stats AS (
         pg_total_relation_size(c.oid) AS total_bytes,
         pg_relation_size(c.oid)       AS data_bytes,
         pg_indexes_size(c.oid)        AS index_bytes,
-        NULL::boolean                 AS compression_enabled
+        NULL::boolean                 AS compression_enabled,
+        NULL::interval                AS chunk_interval
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'public'
@@ -49,11 +50,21 @@ WITH table_stats AS (
         COALESCE(s.total_bytes, 0) AS total_bytes,
         COALESCE(s.table_bytes, 0) AS data_bytes,
         COALESCE(s.index_bytes, 0) AS index_bytes,
-        h.compression_enabled      AS compression_enabled
+        h.compression_enabled      AS compression_enabled,
+        d.time_interval            AS chunk_interval
     FROM timescaledb_information.hypertables h
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) s
+    -- чанк-интервал: берём первое временное измерение (dimension_number = 1)
+    LEFT JOIN LATERAL (
+        SELECT time_interval
+        FROM timescaledb_information.dimensions d
+        WHERE d.hypertable_schema = h.hypertable_schema
+          AND d.hypertable_name   = h.hypertable_name
+          AND d.dimension_number  = 1
+        LIMIT 1
+    ) d ON true
     WHERE h.hypertable_schema = 'public'
 )
 SELECT
@@ -67,7 +78,8 @@ SELECT
         WHEN table_type = 'table'        THEN '—'
         WHEN compression_enabled = true  THEN '✓ включено'
         WHEN compression_enabled = false THEN '✗ выключено'
-    END AS columnstore
+    END AS columnstore,
+    COALESCE(chunk_interval::text, '—') AS chunk_interval
 FROM table_stats
 ORDER BY
     type_order  ASC,
@@ -87,7 +99,8 @@ WITH table_stats AS (
         pg_total_relation_size(c.oid) AS total_bytes,
         pg_relation_size(c.oid)       AS data_bytes,
         pg_indexes_size(c.oid)        AS index_bytes,
-        NULL::boolean                 AS compression_enabled
+        NULL::boolean                 AS compression_enabled,
+        NULL::interval                AS chunk_interval
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'r'
@@ -120,11 +133,21 @@ WITH table_stats AS (
         COALESCE(s.total_bytes, 0) AS total_bytes,
         COALESCE(s.table_bytes, 0) AS data_bytes,
         COALESCE(s.index_bytes, 0) AS index_bytes,
-        h.compression_enabled      AS compression_enabled
+        h.compression_enabled      AS compression_enabled,
+        d.time_interval            AS chunk_interval
     FROM timescaledb_information.hypertables h
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) s
+    -- чанк-интервал: берём первое временное измерение (dimension_number = 1)
+    LEFT JOIN LATERAL (
+        SELECT time_interval
+        FROM timescaledb_information.dimensions d
+        WHERE d.hypertable_schema = h.hypertable_schema
+          AND d.hypertable_name   = h.hypertable_name
+          AND d.dimension_number  = 1
+        LIMIT 1
+    ) d ON true
     WHERE h.hypertable_schema NOT IN (
         '_timescaledb_internal', '_timescaledb_catalog',
         '_timescaledb_config',   '_timescaledb_cache'
@@ -141,7 +164,8 @@ SELECT
         WHEN table_type = 'table'        THEN '—'
         WHEN compression_enabled = true  THEN '✓ включено'
         WHEN compression_enabled = false THEN '✗ выключено'
-    END AS columnstore
+    END AS columnstore,
+    COALESCE(chunk_interval::text, '—') AS chunk_interval
 FROM table_stats
 ORDER BY
     type_order  ASC,
