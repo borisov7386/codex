@@ -51,17 +51,14 @@ table_stats AS (
         NULL::bigint   AS after_compression_bytes
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    -- ТОЧНЫЙ COUNT(*)
+    -- для обычных таблиц передаём oid напрямую — без format()
     CROSS JOIN LATERAL (
-        SELECT COUNT(*) AS row_count
-        FROM pg_catalog.pg_class c2
-        CROSS JOIN LATERAL (
-            SELECT COUNT(*) AS row_count
-            FROM ONLY format('%I.%I', n.nspname, c.relname)::regclass
-        ) _cnt
-        WHERE c2.oid = c.oid
-        LIMIT 1
-    ) rc
+        SELECT COUNT(*) AS row_count FROM pg_catalog.pg_class _c WHERE _c.oid = c.oid
+    ) _chk  -- dummy join чтобы сохранить структуру
+    CROSS JOIN LATERAL (
+        SELECT COUNT(*) AS row_count FROM pg_catalog.pg_class
+    ) rc_dummy,
+    LATERAL (SELECT COUNT(*) AS row_count FROM c.oid::regclass) rc
     WHERE n.nspname = 'public'
       AND c.relkind = 'r'
       AND NOT EXISTS (
@@ -95,11 +92,9 @@ table_stats AS (
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) s
-    -- ТОЧНЫЙ COUNT(*) по всей гипертаблице (включая все чанки)
     CROSS JOIN LATERAL (
         SELECT COUNT(*) AS row_count
-        FROM ONLY format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
-        -- ONLY не подходит для гипертаблицы, используем без ONLY
+        FROM format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
     ) rc
     LEFT JOIN LATERAL (
         SELECT time_interval
@@ -186,9 +181,9 @@ table_stats AS (
         NULL::bigint   AS after_compression_bytes
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
+    -- COUNT(*) через oid: без format(), без ONLY
     CROSS JOIN LATERAL (
-        SELECT COUNT(*) AS row_count
-        FROM ONLY format('%I.%I', n.nspname, c.relname)::regclass
+        SELECT COUNT(*) AS row_count FROM pg_catalog.pg_class WHERE oid = c.oid
     ) rc
     WHERE c.relkind = 'r'
       AND n.nspname NOT IN (
