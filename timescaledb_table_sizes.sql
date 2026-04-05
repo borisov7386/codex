@@ -9,6 +9,11 @@
 --   index_size              — индексы
 --   columnstore             — включено ли сжатие
 --   chunk_interval          — интервал партиционирования
+--   row_count               — приближённое кол-во строк
+--                             для таблиц: pg_class.reltuples
+--                             для гипертаблиц: approximate_row_count() —
+--                               сумма reltuples по всем чанкам,
+--                               учитывает батчи сжатых чанков
 --
 --   uncompressed_chunks     — физический размер чанков, которые НЕ сжаты (на диске)
 --   compressed_chunks       — физический размер чанков, которые УЖЕ сжаты (на диске)
@@ -30,17 +35,12 @@
 -- ВАРИАНТ 1: Конкретная схема (замените 'public' на нужную)
 -- =============================================================================
 WITH
--- Физические размеры чанков из low-level представления
 hyper_chunk_sizes AS (
     SELECT
         hypertable_schema,
         hypertable_name,
-        -- несжатые чанки: compressed_total_size = 0
-        SUM(CASE WHEN compressed_total_size = 0 THEN total_bytes ELSE 0 END)
-            AS uncompressed_chunks_bytes,
-        -- сжатые чанки: берём их фактический compressed_total_size
-        SUM(CASE WHEN compressed_total_size > 0 THEN compressed_total_size ELSE 0 END)
-            AS compressed_chunks_bytes
+        SUM(CASE WHEN compressed_total_size = 0 THEN total_bytes        ELSE 0 END) AS uncompressed_chunks_bytes,
+        SUM(CASE WHEN compressed_total_size > 0 THEN compressed_total_size ELSE 0 END) AS compressed_chunks_bytes
     FROM _timescaledb_internal.hypertable_chunk_local_size
     GROUP BY hypertable_schema, hypertable_name
 ),
@@ -56,6 +56,8 @@ table_stats AS (
         pg_indexes_size(c.oid)        AS index_bytes,
         NULL::boolean  AS compression_enabled,
         NULL::interval AS chunk_interval,
+        -- Приближённое кол-во строк из статистики планировщика
+        GREATEST(c.reltuples, 0)::bigint AS row_count,
         NULL::bigint   AS uncompressed_chunks_bytes,
         NULL::bigint   AS compressed_chunks_bytes,
         NULL::bigint   AS before_compression_bytes,
@@ -86,6 +88,10 @@ table_stats AS (
         COALESCE(s.index_bytes, 0)  AS index_bytes,
         h.compression_enabled       AS compression_enabled,
         d.time_interval             AS chunk_interval,
+        -- approximate_row_count учитывает батчи сжатых чанков
+        approximate_row_count(
+            format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
+        )                           AS row_count,
         COALESCE(ch.uncompressed_chunks_bytes, 0) AS uncompressed_chunks_bytes,
         COALESCE(ch.compressed_chunks_bytes,   0) AS compressed_chunks_bytes,
         cs.before_compression_total_bytes         AS before_compression_bytes,
@@ -104,7 +110,7 @@ table_stats AS (
     ) d ON true
     LEFT JOIN hyper_chunk_sizes ch
         ON ch.hypertable_schema = h.hypertable_schema
-        AND ch.hypertable_name  = h.hypertable_name
+       AND ch.hypertable_name   = h.hypertable_name
     LEFT JOIN LATERAL (
         SELECT
             before_compression_total_bytes,
@@ -120,38 +126,31 @@ SELECT
     schema_name,
     table_name,
     table_type,
-    pg_size_pretty(total_bytes)                AS total_size,
-    pg_size_pretty(data_bytes)                 AS data_size,
-    pg_size_pretty(index_bytes)                AS index_size,
+    to_char(row_count, 'FM999,999,999,999') AS row_count,
+    pg_size_pretty(total_bytes)             AS total_size,
+    pg_size_pretty(data_bytes)              AS data_size,
+    pg_size_pretty(index_bytes)             AS index_size,
     CASE
         WHEN table_type = 'table'        THEN '—'
         WHEN compression_enabled = true  THEN '✓ включено'
         WHEN compression_enabled = false THEN '✗ выключено'
-    END                                        AS columnstore,
-    COALESCE(chunk_interval::text, '—')        AS chunk_interval,
-    -- Физические размеры чанков на диске
+    END                                     AS columnstore,
+    COALESCE(chunk_interval::text, '—')     AS chunk_interval,
     CASE WHEN table_type = 'hypertable'
         THEN pg_size_pretty(uncompressed_chunks_bytes)
-        ELSE '—' END                           AS uncompressed_chunks,
+        ELSE '—' END                        AS uncompressed_chunks,
     CASE WHEN table_type = 'hypertable'
         THEN pg_size_pretty(compressed_chunks_bytes)
-        ELSE '—' END                           AS compressed_chunks,
-    -- Статистика сжатия (before/after)
+        ELSE '—' END                        AS compressed_chunks,
     COALESCE(pg_size_pretty(before_compression_bytes), '—') AS before_compression_size,
     COALESCE(pg_size_pretty(after_compression_bytes),  '—') AS after_compression_size,
-    -- Коэффициент сжатия
     CASE
         WHEN after_compression_bytes > 0
-        THEN round(
-            before_compression_bytes::numeric / after_compression_bytes::numeric,
-            2
-        )::text || 'x'
+        THEN round(before_compression_bytes::numeric / after_compression_bytes::numeric, 2)::text || 'x'
         ELSE '—'
-    END                                        AS compression_ratio
+    END                                     AS compression_ratio
 FROM table_stats
-ORDER BY
-    type_order  ASC,
-    total_bytes DESC;
+ORDER BY type_order ASC, total_bytes DESC;
 
 
 -- =============================================================================
@@ -162,10 +161,8 @@ hyper_chunk_sizes AS (
     SELECT
         hypertable_schema,
         hypertable_name,
-        SUM(CASE WHEN compressed_total_size = 0 THEN total_bytes ELSE 0 END)
-            AS uncompressed_chunks_bytes,
-        SUM(CASE WHEN compressed_total_size > 0 THEN compressed_total_size ELSE 0 END)
-            AS compressed_chunks_bytes
+        SUM(CASE WHEN compressed_total_size = 0 THEN total_bytes        ELSE 0 END) AS uncompressed_chunks_bytes,
+        SUM(CASE WHEN compressed_total_size > 0 THEN compressed_total_size ELSE 0 END) AS compressed_chunks_bytes
     FROM _timescaledb_internal.hypertable_chunk_local_size
     GROUP BY hypertable_schema, hypertable_name
 ),
@@ -181,6 +178,7 @@ table_stats AS (
         pg_indexes_size(c.oid)        AS index_bytes,
         NULL::boolean  AS compression_enabled,
         NULL::interval AS chunk_interval,
+        GREATEST(c.reltuples, 0)::bigint AS row_count,
         NULL::bigint   AS uncompressed_chunks_bytes,
         NULL::bigint   AS compressed_chunks_bytes,
         NULL::bigint   AS before_compression_bytes,
@@ -215,6 +213,9 @@ table_stats AS (
         COALESCE(s.index_bytes, 0)  AS index_bytes,
         h.compression_enabled       AS compression_enabled,
         d.time_interval             AS chunk_interval,
+        approximate_row_count(
+            format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
+        )                           AS row_count,
         COALESCE(ch.uncompressed_chunks_bytes, 0) AS uncompressed_chunks_bytes,
         COALESCE(ch.compressed_chunks_bytes,   0) AS compressed_chunks_bytes,
         cs.before_compression_total_bytes         AS before_compression_bytes,
@@ -233,7 +234,7 @@ table_stats AS (
     ) d ON true
     LEFT JOIN hyper_chunk_sizes ch
         ON ch.hypertable_schema = h.hypertable_schema
-        AND ch.hypertable_name  = h.hypertable_name
+       AND ch.hypertable_name   = h.hypertable_name
     LEFT JOIN LATERAL (
         SELECT
             before_compression_total_bytes,
@@ -252,35 +253,28 @@ SELECT
     schema_name,
     table_name,
     table_type,
-    pg_size_pretty(total_bytes)                AS total_size,
-    pg_size_pretty(data_bytes)                 AS data_size,
-    pg_size_pretty(index_bytes)                AS index_size,
+    to_char(row_count, 'FM999,999,999,999') AS row_count,
+    pg_size_pretty(total_bytes)             AS total_size,
+    pg_size_pretty(data_bytes)              AS data_size,
+    pg_size_pretty(index_bytes)             AS index_size,
     CASE
         WHEN table_type = 'table'        THEN '—'
         WHEN compression_enabled = true  THEN '✓ включено'
         WHEN compression_enabled = false THEN '✗ выключено'
-    END                                        AS columnstore,
-    COALESCE(chunk_interval::text, '—')        AS chunk_interval,
-    -- Физические размеры чанков на диске
+    END                                     AS columnstore,
+    COALESCE(chunk_interval::text, '—')     AS chunk_interval,
     CASE WHEN table_type = 'hypertable'
         THEN pg_size_pretty(uncompressed_chunks_bytes)
-        ELSE '—' END                           AS uncompressed_chunks,
+        ELSE '—' END                        AS uncompressed_chunks,
     CASE WHEN table_type = 'hypertable'
         THEN pg_size_pretty(compressed_chunks_bytes)
-        ELSE '—' END                           AS compressed_chunks,
-    -- Статистика сжатия (before/after)
+        ELSE '—' END                        AS compressed_chunks,
     COALESCE(pg_size_pretty(before_compression_bytes), '—') AS before_compression_size,
     COALESCE(pg_size_pretty(after_compression_bytes),  '—') AS after_compression_size,
-    -- Коэффициент сжатия
     CASE
         WHEN after_compression_bytes > 0
-        THEN round(
-            before_compression_bytes::numeric / after_compression_bytes::numeric,
-            2
-        )::text || 'x'
+        THEN round(before_compression_bytes::numeric / after_compression_bytes::numeric, 2)::text || 'x'
         ELSE '—'
-    END                                        AS compression_ratio
+    END                                     AS compression_ratio
 FROM table_stats
-ORDER BY
-    type_order  ASC,
-    total_bytes DESC;
+ORDER BY type_order ASC, total_bytes DESC;
