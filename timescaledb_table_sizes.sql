@@ -2,6 +2,8 @@
 -- TimescaleDB: размеры таблиц и гипертаблиц
 -- Версия: TimescaleDB 2.18+
 -- Сортировка: сначала обычные таблицы, затем гипертаблицы (по убыванию размера)
+-- Столбец columnstore: для гипертаблиц показывает статус сжатия (Columnstore)
+--   Источник: timescaledb_information.hypertables.compression_enabled
 -- =============================================================================
 
 
@@ -17,7 +19,8 @@ WITH table_stats AS (
         1         AS type_order,
         pg_total_relation_size(c.oid) AS total_bytes,
         pg_relation_size(c.oid)       AS data_bytes,
-        pg_indexes_size(c.oid)        AS index_bytes
+        pg_indexes_size(c.oid)        AS index_bytes,
+        NULL::boolean                 AS compression_enabled
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'public'
@@ -45,7 +48,8 @@ WITH table_stats AS (
         2                   AS type_order,
         COALESCE(s.total_bytes, 0) AS total_bytes,
         COALESCE(s.table_bytes, 0) AS data_bytes,
-        COALESCE(s.index_bytes, 0) AS index_bytes
+        COALESCE(s.index_bytes, 0) AS index_bytes,
+        h.compression_enabled      AS compression_enabled
     FROM timescaledb_information.hypertables h
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
@@ -58,10 +62,15 @@ SELECT
     table_type,
     pg_size_pretty(total_bytes) AS total_size,
     pg_size_pretty(data_bytes)  AS data_size,
-    pg_size_pretty(index_bytes) AS index_size
+    pg_size_pretty(index_bytes) AS index_size,
+    CASE
+        WHEN table_type = 'table'        THEN '—'
+        WHEN compression_enabled = true  THEN '✓ включено'
+        WHEN compression_enabled = false THEN '✗ выключено'
+    END AS columnstore
 FROM table_stats
 ORDER BY
-    type_order ASC,
+    type_order  ASC,
     total_bytes DESC;
 
 
@@ -77,7 +86,8 @@ WITH table_stats AS (
         1         AS type_order,
         pg_total_relation_size(c.oid) AS total_bytes,
         pg_relation_size(c.oid)       AS data_bytes,
-        pg_indexes_size(c.oid)        AS index_bytes
+        pg_indexes_size(c.oid)        AS index_bytes,
+        NULL::boolean                 AS compression_enabled
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'r'
@@ -109,7 +119,8 @@ WITH table_stats AS (
         2                   AS type_order,
         COALESCE(s.total_bytes, 0) AS total_bytes,
         COALESCE(s.table_bytes, 0) AS data_bytes,
-        COALESCE(s.index_bytes, 0) AS index_bytes
+        COALESCE(s.index_bytes, 0) AS index_bytes,
+        h.compression_enabled      AS compression_enabled
     FROM timescaledb_information.hypertables h
     CROSS JOIN LATERAL hypertable_detailed_size(
         format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass
@@ -125,9 +136,13 @@ SELECT
     table_type,
     pg_size_pretty(total_bytes) AS total_size,
     pg_size_pretty(data_bytes)  AS data_size,
-    pg_size_pretty(index_bytes) AS index_size
+    pg_size_pretty(index_bytes) AS index_size,
+    CASE
+        WHEN table_type = 'table'        THEN '—'
+        WHEN compression_enabled = true  THEN '✓ включено'
+        WHEN compression_enabled = false THEN '✗ выключено'
+    END AS columnstore
 FROM table_stats
 ORDER BY
     type_order  ASC,
-    schema_name ASC,
     total_bytes DESC;
